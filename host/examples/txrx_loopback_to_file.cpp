@@ -427,22 +427,27 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         rx_usrp->set_time_unknown_pps(uhd::time_spec_t(0.0));
     }
 
-    // for the const wave, set the wave freq for small samples per period
-    if (wave_freq == 0 and wave_type == "CONST") {
-        wave_freq = tx_usrp->get_tx_rate() / 2;
+    size_t step;
+    if (wave_type == "CHIRP") {
+        step = 1;
     }
+    else{
+        // for the const wave, set the wave freq for small samples per period
+        if (wave_freq == 0 and wave_type == "CONST") {
+            wave_freq = tx_usrp->get_tx_rate() / 2;
+        }
 
-    // error when the waveform is not possible to generate
-    if (std::abs(wave_freq) > tx_usrp->get_tx_rate() / 2) {
-        throw std::runtime_error("wave freq out of Nyquist zone");
+        // error when the waveform is not possible to generate
+        if (std::abs(wave_freq) > tx_usrp->get_tx_rate() / 2) {
+            throw std::runtime_error("wave freq out of Nyquist zone");
+        }
+        if (tx_usrp->get_tx_rate() / std::abs(wave_freq) > wave_table_len / 2) {
+            throw std::runtime_error("wave freq too small for table");
+        }
+        step = std::lround(wave_freq / tx_usrp->get_tx_rate() * wave_table_len);
     }
-    if (tx_usrp->get_tx_rate() / std::abs(wave_freq) > wave_table_len / 2) {
-        throw std::runtime_error("wave freq too small for table");
-    }
-
     // pre-compute the waveform values
     const wave_table_class wave_table(wave_type, ampl);
-    const size_t step = std::lround(wave_freq / tx_usrp->get_tx_rate() * wave_table_len);
     size_t index      = 0;
 
     // create a transmit streamer

@@ -61,6 +61,20 @@ public:
                     ampl * std::exp(J * static_cast<float>(tau * i / wave_table_len));
             }
             _power_dbfs = static_cast<double>(20 * std::log10(ampl));
+        } else if (wave_type == "CHIRP") {
+            static const double tau = 2 * std::acos(-1.0);
+            static const std::complex<float> J(0, 1);
+            const float f0 = 0.0f;        // normalized start frequency
+            const float B  = 0.5f;        // normalized bandwidth (0~0.5)
+            const float k  = B / wave_table_len; //chirp rate
+            float energy_acc = 0.0f;
+            for (size_t i = 0; i < wave_table_len; i++) {
+                float phase =
+                    tau * (f0 * i + 0.5f * k * i * i);
+                _wave_table[i] = ampl * std::exp(J * phase);
+                energy_acc += std::norm(_wave_table[i]);
+            }
+            _power_dbfs = static_cast<double>(energy_acc / wave_table_len); //linear power
         } else {
             throw std::runtime_error("unknown waveform type: " + wave_type);
         }
