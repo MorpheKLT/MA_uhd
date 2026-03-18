@@ -18,6 +18,8 @@
 #include <boost/program_options.hpp>
 #include <cmath>
 #include <csignal>
+#include <queue>
+#include <condition_variable>
 #include <fstream>
 #include <functional>
 #include <iostream>
@@ -67,25 +69,33 @@ void transmit_worker(std::vector<std::complex<float>> buff,
 {
     std::vector<std::complex<float>*> buffs(num_channels, &buff.front());
 
-    // send data until the signal handler gets called
-    while (not stop_signal_called) {
-        // fill the buffer with the waveform
-        for (size_t n = 0; n < buff.size(); n++) {
-            buff[n] = wave_table(index += step);
-        }
+    // // send data until the signal handler gets called
+    // while (not stop_signal_called) {
+    //     // fill the buffer with the waveform
+    //     for (size_t n = 0; n < buff.size(); n++) {
+    //         buff[n] = wave_table(index += step);
+    //     }
 
-        // send the entire contents of the buffer
-        tx_streamer->send(buffs, buff.size(), metadata);
+    //     // send the entire contents of the buffer
+    //     tx_streamer->send(buffs, buff.size(), metadata);
 
-        metadata.start_of_burst = false;
-        metadata.has_time_spec  = false;
+    //     metadata.start_of_burst = false;
+    //     metadata.has_time_spec  = false;
+    // }
+
+    // Only send data once
+    for (size_t n = 0; n < buff.size(); n++) {
+        buff[n] = wave_table(index += step);
     }
+    // send the entire contents of the buffer
+    tx_streamer->send(buffs, buff.size(), metadata);    
 
+    metadata.start_of_burst = false;
+    metadata.has_time_spec  = false;
     // send a mini EOB packet
     metadata.end_of_burst = true;
     tx_streamer->send("", 0, metadata);
 }
-
 
 /***********************************************************************
  * recv_to_file function
@@ -100,6 +110,13 @@ void recv_to_file(uhd::usrp::multi_usrp::sptr usrp,
     double settling_time,
     std::vector<size_t> rx_channel_nums)
 {
+    using Buffer = std::vector<std::vector<samp_type>>;
+
+    std::queue<std::pair<Buffer, size_t>> queue;
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool done = false;
+
     int num_total_samps = 0;
     // create a receive streamer
     uhd::stream_args_t stream_args(cpu_format, wire_format);
@@ -108,12 +125,17 @@ void recv_to_file(uhd::usrp::multi_usrp::sptr usrp,
 
     // Prepare buffers for received samples and metadata
     uhd::rx_metadata_t md;
-    std::vector<std::vector<samp_type>> buffs(
+
+    // ===== double buffer =====
+    Buffer buffs(
+        rx_channel_nums.size(), std::vector<samp_type>(samps_per_buff));
+    Buffer buffs_swap(
         rx_channel_nums.size(), std::vector<samp_type>(samps_per_buff));
     // create a vector of pointers to point to each of the channel buffers
     std::vector<samp_type*> buff_ptrs;
     for (size_t i = 0; i < buffs.size(); i++) {
-        buff_ptrs.push_back(&buffs[i].front());
+        buff_ptrs.push_back(buffs[i].data()); 
+        //.data() returns the Ptr of the first element in std::vector
     }
 
     // Create one ofstream object per channel
@@ -121,16 +143,44 @@ void recv_to_file(uhd::usrp::multi_usrp::sptr usrp,
     std::vector<std::shared_ptr<std::ofstream>> outfiles;
     for (size_t i = 0; i < buffs.size(); i++) {
         const std::string this_filename = generate_out_filename(file, buffs.size(), i);
-        outfiles.push_back(std::shared_ptr<std::ofstream>(
-            new std::ofstream(this_filename.c_str(), std::ofstream::binary)));
+        outfiles.push_back(std::make_shared<std::ofstream>(
+            this_filename.c_str(), std::ofstream::binary));
     }
     UHD_ASSERT_THROW(outfiles.size() == buffs.size());
     UHD_ASSERT_THROW(buffs.size() == rx_channel_nums.size());
     bool overflow_message = true;
     // We increase the first timeout to cover for the delay between now + the
-    // command time, plus 500ms of buffer. In the loop, we will then reduce the
+    // command time, plus 4000ms of buffer. In the loop, we will then reduce the
     // timeout for subsequent receives.
     double timeout = settling_time + 0.5f;
+
+    // ===== writer thread =====
+    std::thread writer_thread([&]() {
+        while (true) {
+            std::unique_lock<std::mutex> lock(mtx);
+            cv.wait(lock, [&]() { return !queue.empty() || done; });
+            // temporarily unlock, and thread will sleep
+            // until queue not empty or done, and then relock
+            while (!queue.empty()) {
+                auto item = std::move(queue.front()); 
+                queue.pop();
+                lock.unlock();
+
+                auto& data = item.first;
+                size_t num_rx_samps = item.second;
+
+                for (size_t i = 0; i < outfiles.size(); i++) {
+                    outfiles[i]->write(
+                        (const char*)data[i].data(), num_rx_samps * sizeof(samp_type));
+                }
+
+                lock.lock();
+            }
+
+            if (done && queue.empty())
+                break;
+        }
+    });
 
     // setup streaming
     uhd::stream_cmd_t stream_cmd((num_requested_samples == 0)
@@ -170,12 +220,26 @@ void recv_to_file(uhd::usrp::multi_usrp::sptr usrp,
 
         num_total_samps += num_rx_samps;
 
-        for (size_t i = 0; i < outfiles.size(); i++) {
-            outfiles[i]->write(
-                (const char*)buff_ptrs[i], num_rx_samps * sizeof(samp_type));
+        // swap to the other empty buffer
+        std::swap(buffs, buffs_swap);
+        for (size_t i = 0; i < buffs.size(); i++) {
+            buff_ptrs[i] = buffs[i].data(); //follow the updated Ptr of buffs
         }
+
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            queue.emplace(std::move(buffs_swap), num_rx_samps);
+        }
+        cv.notify_one();
     }
 
+    // set done to true, so that the writer would be notified to break 
+    {
+        std::lock_guard<std::mutex> lock(mtx);
+        done = true;
+    }
+    cv.notify_all();
+    writer_thread.join();
     // Shut down receiver
     stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
     rx_stream->issue_stream_cmd(stream_cmd);
@@ -185,7 +249,101 @@ void recv_to_file(uhd::usrp::multi_usrp::sptr usrp,
         outfiles[i]->close();
     }
 }
+// template <typename samp_type>
+// void recv_to_file(uhd::usrp::multi_usrp::sptr usrp,
+//     const std::string& cpu_format,
+//     const std::string& wire_format,
+//     const std::string& file,
+//     size_t samps_per_buff,
+//     int num_requested_samples,
+//     double settling_time,
+//     std::vector<size_t> rx_channel_nums)
+// {
+//     int num_total_samps = 0;
+//     // create a receive streamer
+//     uhd::stream_args_t stream_args(cpu_format, wire_format);
+//     stream_args.channels             = rx_channel_nums;
+//     uhd::rx_streamer::sptr rx_stream = usrp->get_rx_stream(stream_args);
 
+//     // Prepare buffers for received samples and metadata
+//     uhd::rx_metadata_t md;
+//     std::vector<std::vector<samp_type>> buffs(
+//         rx_channel_nums.size(), std::vector<samp_type>(samps_per_buff));
+//     // create a vector of pointers to point to each of the channel buffers
+//     std::vector<samp_type*> buff_ptrs;
+//     for (size_t i = 0; i < buffs.size(); i++) {
+//         buff_ptrs.push_back(&buffs[i].front());
+//     }
+
+//     // Create one ofstream object per channel
+//     // (use shared_ptr because ofstream is non-copyable)
+//     std::vector<std::shared_ptr<std::ofstream>> outfiles;
+//     for (size_t i = 0; i < buffs.size(); i++) {
+//         const std::string this_filename = generate_out_filename(file, buffs.size(), i);
+//         outfiles.push_back(std::shared_ptr<std::ofstream>(
+//             new std::ofstream(this_filename.c_str(), std::ofstream::binary)));
+//     }
+//     UHD_ASSERT_THROW(outfiles.size() == buffs.size());
+//     UHD_ASSERT_THROW(buffs.size() == rx_channel_nums.size());
+//     bool overflow_message = true;
+//     // We increase the first timeout to cover for the delay between now + the
+//     // command time, plus 500ms of buffer. In the loop, we will then reduce the
+//     // timeout for subsequent receives.
+//     double timeout = settling_time + 0.5f;
+
+//     // setup streaming
+//     uhd::stream_cmd_t stream_cmd((num_requested_samples == 0)
+//                                      ? uhd::stream_cmd_t::STREAM_MODE_START_CONTINUOUS
+//                                      : uhd::stream_cmd_t::STREAM_MODE_NUM_SAMPS_AND_DONE);
+//     stream_cmd.num_samps  = num_requested_samples;
+//     stream_cmd.stream_now = false;
+//     stream_cmd.time_spec  = usrp->get_time_now() + uhd::time_spec_t(settling_time);
+//     rx_stream->issue_stream_cmd(stream_cmd);
+
+//     while (not stop_signal_called
+//            and (num_requested_samples > num_total_samps or num_requested_samples == 0)) {
+//         size_t num_rx_samps = rx_stream->recv(buff_ptrs, samps_per_buff, md, timeout);
+//         timeout             = 0.1f; // small timeout for subsequent recv
+
+//         if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_TIMEOUT) {
+//             std::cout << "Timeout while streaming" << std::endl;
+//             break;
+//         }
+//         if (md.error_code == uhd::rx_metadata_t::ERROR_CODE_OVERFLOW) {
+//             if (overflow_message) {
+//                 overflow_message = false;
+//                 std::cerr
+//                     << boost::format(
+//                            "Got an overflow indication. Please consider the following:\n"
+//                            "  Your write medium must sustain a rate of %fMB/s.\n"
+//                            "  Dropped samples will not be written to the file.\n"
+//                            "  Please modify this example for your purposes.\n"
+//                            "  This message will not appear again.\n")
+//                            % (usrp->get_rx_rate() * sizeof(samp_type) / 1e6);
+//             }
+//             continue;
+//         }
+//         if (md.error_code != uhd::rx_metadata_t::ERROR_CODE_NONE) {
+//             throw std::runtime_error("Receiver error " + md.strerror());
+//         }
+
+//         num_total_samps += num_rx_samps;
+
+//         for (size_t i = 0; i < outfiles.size(); i++) {
+//             outfiles[i]->write(
+//                 (const char*)buff_ptrs[i], num_rx_samps * sizeof(samp_type));
+//         }
+//     }
+
+//     // Shut down receiver
+//     stream_cmd.stream_mode = uhd::stream_cmd_t::STREAM_MODE_STOP_CONTINUOUS;
+//     rx_stream->issue_stream_cmd(stream_cmd);
+
+//     // Close files
+//     for (size_t i = 0; i < outfiles.size(); i++) {
+//         outfiles[i]->close();
+//     }
+// }
 
 /***********************************************************************
  * Main function
@@ -213,7 +371,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
         ("file", po::value<std::string>(&file)->default_value("usrp_samples.dat"), "name of the file to write binary samples to")
         ("type", po::value<std::string>(&type)->default_value("short"), "sample type in file: double, float, or short")
         ("nsamps", po::value<size_t>(&total_num_samps)->default_value(0), "total number of samples to receive")
-        ("settling", po::value<double>(&settling)->default_value(double(0.2)), "settling time (seconds) before receiving")
+        ("settling", po::value<double>(&settling)->default_value(double(5.0)), "settling time (seconds) before receiving")
         ("spb", po::value<size_t>(&spb)->default_value(0), "samples per buffer, 0 for default")
         ("tx-rate", po::value<double>(&tx_rate), "rate of transmit outgoing samples")
         ("rx-rate", po::value<double>(&rx_rate), "rate of receive incoming samples")
@@ -459,7 +617,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     // allocate a buffer which we re-use for each channel
     if (spb == 0)
         spb = tx_stream->get_max_num_samps() * 10;
-    std::vector<std::complex<float>> buff(spb);
+    std::vector<std::complex<float>> buff(total_num_samps * 8); //send enough long data only once
     int num_channels = tx_channel_nums.size();
 
     // setup the metadata flags
@@ -467,7 +625,7 @@ int UHD_SAFE_MAIN(int argc, char* argv[])
     md.start_of_burst = true;
     md.end_of_burst   = false;
     md.has_time_spec  = true;
-    md.time_spec = uhd::time_spec_t(0.5); // give us 0.5 seconds to fill the tx buffers
+    md.time_spec = uhd::time_spec_t(4.0); // give us 4.0 seconds to fill the tx buffers
 
     // Check Ref and LO Lock detect
     std::vector<std::string> tx_sensor_names, rx_sensor_names;
