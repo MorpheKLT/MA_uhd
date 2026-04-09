@@ -32,6 +32,7 @@ set(example_sources
     rfnoc_rx_to_file.cpp
     rfnoc_radio_loopback.cpp
     rfnoc_replay_samples_from_file.cpp
+    txrx_realtime_inference.cpp
 )
 
 if(ENABLE_OCTOCLOCK)
@@ -111,3 +112,10 @@ endif(ENABLE_C_API)
 if(ENABLE_PYTHON_API)
     add_subdirectory(python)
 endif(ENABLE_PYTHON_API)
+
+find_package(Python3 REQUIRED COMPONENTS Development)
+
+include_directories(${Python3_INCLUDE_DIRS})
+target_link_libraries(txrx_realtime_inference
+    ${Python3_LIBRARIES}
+)

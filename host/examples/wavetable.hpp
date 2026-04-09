@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-static const size_t wave_table_len = 8192;
+static const size_t wave_table_len = 128;
 
 class wave_table_class
 {
@@ -64,9 +64,9 @@ public:
         } else if (wave_type == "CHIRP") {
             static const double tau = 2 * std::acos(-1.0);
             static const std::complex<float> J(0, 1);
-            const float f0 = 0.0f;        // normalized start frequency
-            const float B  = 0.5f;        // normalized bandwidth (0~0.5)
-            const float k  = B / wave_table_len; //chirp rate
+            const float f0 = -0.5f;        // normalized start frequency
+            const float B  = 1.0f;        // normalized bandwidth (-0.5~0.5)
+            const float k  = B / (wave_table_len - 1); //chirp rate
             float energy_acc = 0.0f;
             for (size_t i = 0; i < wave_table_len; i++) {
                 float phase =
